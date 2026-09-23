@@ -21,6 +21,16 @@ from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
 from . import clock
 from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
+from .merkle import (
+    MAX_LEAF_COUNT,
+    MERKLE_TREE_SCHEME,
+    ProofStep,
+    build_membership_proof,
+    evaluate_membership_proof,
+    leaf_hash as merkle_leaf_hash,
+    merkle_depth,
+    merkle_root,
+)
 from .models import Commitment, DeadlineExtension, Event, Reveal, Settlement
 from .scheduling import PHASES as SCHEDULE_PHASES, schedule
 from .schemas import (
@@ -37,6 +47,10 @@ from .schemas import (
     EventOut,
     EventSnapshotOut,
     HashOut,
+    MerkleProofOut,
+    MerkleSetOut,
+    MerkleVerifyOut,
+    MerkleVerifyRequest,
     RevealBatchCreate,
     RevealBatchOut,
     RevealCreate,
@@ -1286,4 +1300,181 @@ def get_timeline(event_id: UUID, db: Session = Depends(get_db)):
         generated_at=now,
         hash_scheme=HASH_SCHEME,
         entries=timeline,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 事件承诺集合 Merkle 证明
+# --------------------------------------------------------------------------- #
+
+def _event_commitment_leaves(db: Session, event_id: UUID) -> list[tuple[UUID, str, str]]:
+    """读取事件全部承诺并按 commitment_id 升序，返回 (id, 承诺哈希, 叶哈希)。
+
+    Merkle 叶序只依赖承诺 ID，与提交时间、插入顺序无关，保证同一集合的根
+    逐次请求稳定可复现。
+    """
+    rows = (
+        db.query(Commitment.id, Commitment.commitment_hash)
+        .filter(Commitment.event_id == event_id)
+        .all()
+    )
+    ordered = sorted(rows, key=lambda row: row[0])
+    return [
+        (cid, chash, merkle_leaf_hash(event_id, cid, chash))
+        for cid, chash in ordered
+    ]
+
+
+def _require_commit_phase_closed(event: Event, now: datetime) -> None:
+    """承诺集合证明仅在提交截止（含）之后签发；未过截止返回 409。"""
+    commit_dl = as_utc(event.commit_deadline)
+    if now < commit_dl:
+        raise api_error(
+            409,
+            "MERKLE_PROOF_NOT_AVAILABLE",
+            "承诺集合证明仅在提交截止后签发：提交截止时间为 "
+            f"{commit_dl.isoformat()}，当前服务端时间 {now.isoformat()}",
+        )
+
+
+@app.get("/events/{event_id}/commitments/merkle", response_model=MerkleSetOut)
+def get_commitment_merkle(event_id: UUID, db: Session = Depends(get_db)):
+    """提交截止后返回事件承诺集合的 Merkle 根与承诺数量（纯只读）。
+
+    叶节点按承诺 ID 升序；叶哈希绑定事件 ID、承诺 ID 与原承诺哈希。
+    空集合返回明确的固定空根（EMPTY_ROOT）与零数量，无需调用方特殊处理。
+    未过提交截止返回 409 MERKLE_PROOF_NOT_AVAILABLE；事件不存在返回 404。
+    """
+    event = get_event_or_404(db, event_id)
+    now = now_utc()
+    _require_commit_phase_closed(event, now)
+
+    leaves = _event_commitment_leaves(db, event.id)
+    return MerkleSetOut(
+        event_id=event.id,
+        merkle_root=merkle_root([leaf for _, _, leaf in leaves]),
+        commitment_count=len(leaves),
+        tree_scheme=MERKLE_TREE_SCHEME,
+        generated_at=now,
+    )
+
+
+@app.get(
+    "/events/{event_id}/commitments/{commitment_id}/proof",
+    response_model=MerkleProofOut,
+)
+def get_commitment_proof(
+    event_id: UUID, commitment_id: UUID, db: Session = Depends(get_db)
+):
+    """提交截止后为指定承诺签发 Merkle 成员证明（纯只读）。
+
+    证明给出叶下标与自叶向根每层兄弟哈希及左右位置，调用方可据此在本地
+    重算根并与 GET /events/{id}/commitments/merkle 的根比对，无需下载完整
+    时间线。未过提交截止返回 409 MERKLE_PROOF_NOT_AVAILABLE；事件不存在
+    返回 404 EVENT_NOT_FOUND；承诺不存在（或不属于该事件）返回 404
+    COMMITMENT_NOT_FOUND。
+    """
+    event = get_event_or_404(db, event_id)
+    now = now_utc()
+    _require_commit_phase_closed(event, now)
+
+    leaves = _event_commitment_leaves(db, event.id)
+    leaf_index = next(
+        (i for i, (cid, _, _) in enumerate(leaves) if cid == commitment_id),
+        None,
+    )
+    if leaf_index is None:
+        raise api_error(
+            404,
+            "COMMITMENT_NOT_FOUND",
+            f"承诺 {commitment_id} 不存在或不属于事件 {event_id}",
+        )
+
+    commitment_id_value, commitment_hash_value, _ = leaves[leaf_index]
+    steps, root = build_membership_proof(
+        [leaf for _, _, leaf in leaves], leaf_index
+    )
+    return MerkleProofOut(
+        event_id=event.id,
+        commitment_id=commitment_id_value,
+        commitment_hash=commitment_hash_value,
+        leaf_index=leaf_index,
+        merkle_root=root,
+        commitment_count=len(leaves),
+        tree_scheme=MERKLE_TREE_SCHEME,
+        proof=[{"sibling": s.sibling, "position": s.position} for s in steps],
+        generated_at=now,
+    )
+
+
+@app.post("/utils/merkle/verify", response_model=MerkleVerifyOut)
+def verify_commitment_proof(payload: MerkleVerifyRequest):
+    """在服务端本地严格校验一份 Merkle 成员证明（无状态、不访问数据库）。
+
+    校验层次：
+      1. 格式层（pydantic，422）：事件 ID / 承诺 ID 须为 UUID，承诺哈希、
+         Merkle 根及每个兄弟哈希须为 64 位十六进制，proof 须为步骤对象
+         列表（位置仅允许 left / right）；
+      2. 结构与层级层（400 INVALID_MERKLE_PROOF）：承诺数量必须是整数
+         （布尔值除外）且在 [0, 2^64)；空集合无成员证明；路径层数必须
+         恰好等于 ceil(log2(count))，即单叶集合路径必须为空、非单叶集合
+         路径必须非空；
+      3. 密码学层（200）：叶哈希由事件 ID / 承诺 ID / 承诺哈希严格重算，
+         按路径每层兄弟与左右位置折叠出根；与请求声明的根逐字节比较，
+         一致 valid=true，否则 valid=false 并附 reason。
+    """
+    count = payload.commitment_count
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise api_error(
+            400,
+            "INVALID_MERKLE_PROOF",
+            "commitment_count 必须是整数（叶节点总数）",
+        )
+    if count < 0 or count >= MAX_LEAF_COUNT:
+        raise api_error(
+            400,
+            "INVALID_MERKLE_PROOF",
+            f"commitment_count 必须在 [0, {MAX_LEAF_COUNT}) 范围内，收到 {count}",
+        )
+
+    expected_depth = merkle_depth(count)
+    steps = [ProofStep(sibling=s.sibling, position=s.position) for s in payload.proof]
+    if count == 0:
+        raise api_error(
+            400,
+            "INVALID_MERKLE_PROOF",
+            "空承诺集合只有固定空根、不存在成员，无法校验成员证明",
+        )
+    if len(steps) != expected_depth:
+        raise api_error(
+            400,
+            "INVALID_MERKLE_PROOF",
+            f"承诺数量 {count} 要求证明路径恰好 {expected_depth} 层"
+            f"（ceil(log2(count))），实际 {len(steps)} 层；单叶集合路径必须为空",
+        )
+
+    leaf = merkle_leaf_hash(
+        payload.event_id, payload.commitment_id, payload.commitment_hash
+    )
+    computed = evaluate_membership_proof(leaf, steps)
+    expected_root = payload.merkle_root.lower()
+    if computed != expected_root:
+        return MerkleVerifyOut(
+            valid=False,
+            reason=(
+                "按叶数据与证明路径重算的根与声明的 merkle_root 不一致："
+                "承诺不属于该集合，或叶数据 / 路径 / 根被篡改"
+            ),
+            leaf_hash=leaf,
+            computed_root=computed,
+            expected_root=expected_root,
+            tree_scheme=MERKLE_TREE_SCHEME,
+        )
+    return MerkleVerifyOut(
+        valid=True,
+        reason="ok",
+        leaf_hash=leaf,
+        computed_root=computed,
+        expected_root=expected_root,
+        tree_scheme=MERKLE_TREE_SCHEME,
     )

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -250,3 +250,80 @@ class ScheduleOut(BaseModel):
 class HashOut(BaseModel):
     commitment_hash: str
     hash_scheme: str
+
+
+# --------------------------------------------------------------------------- #
+# 事件承诺集合 Merkle 证明
+# --------------------------------------------------------------------------- #
+
+# Merkle 哈希字段统一接受 64 位十六进制（大小写均可，服务端归一化为小写）
+MERKLE_HEX_PATTERN = r"^[0-9a-fA-F]{64}$"
+PROOF_POSITIONS = ("left", "right")
+
+
+class MerkleSetOut(BaseModel):
+    """提交截止后事件承诺集合的 Merkle 承诺（根 + 数量 + 方案）。"""
+
+    event_id: UUID
+    merkle_root: str = Field(
+        description="按承诺 ID 升序构造的 Merkle 根（64 位十六进制）；空集合为固定空根"
+    )
+    commitment_count: int = Field(description="进入 Merkle 树的承诺数量（空集合为 0）")
+    tree_scheme: str = Field(description="Merkle 树与哈希方案标识")
+    generated_at: datetime = Field(description="承诺签发时间（服务端 UTC）")
+
+
+class MerkleProofStepOut(BaseModel):
+    sibling: str = Field(
+        pattern=MERKLE_HEX_PATTERN,
+        description="该层兄弟节点哈希（64 位十六进制）",
+    )
+    position: Literal["left", "right"] = Field(
+        description="兄弟节点相对当前节点的位置：left 表示兄弟在左，right 表示兄弟在右"
+    )
+
+
+class MerkleProofOut(BaseModel):
+    """指定承诺在事件承诺集合中的 Merkle 成员证明。"""
+
+    event_id: UUID
+    commitment_id: UUID
+    commitment_hash: str = Field(description="被证明承诺的原始承诺哈希（叶数据的一部分）")
+    leaf_index: int = Field(
+        description="叶节点在「按承诺 ID 升序」排列的叶序列中的下标（0 起）"
+    )
+    merkle_root: str = Field(description="事件承诺集合的 Merkle 根（64 位十六进制）")
+    commitment_count: int = Field(description="事件承诺总数（叶节点数，>= 1）")
+    tree_scheme: str
+    proof: list[MerkleProofStepOut] = Field(
+        description="自叶向根的每层兄弟节点（含左右位置）；单叶集合为空列表"
+    )
+    generated_at: datetime
+
+
+class MerkleVerifyRequest(BaseModel):
+    """本地 Merkle 成员证明校验请求：调用方把证明接口的全部数据原样回传。
+
+    commitment_count 不使用 int 类型：布尔值、非整数等协议级非法输入须走
+    统一业务错误（400 INVALID_MERKLE_PROOF），而不是 pydantic 的 422。
+    """
+
+    event_id: UUID
+    commitment_id: UUID
+    commitment_hash: str = Field(pattern=MERKLE_HEX_PATTERN)
+    commitment_count: Any = Field(description="叶节点总数（必须是 >= 0 的整数）")
+    merkle_root: str = Field(pattern=MERKLE_HEX_PATTERN)
+    proof: list[MerkleProofStepOut] = Field(
+        description="自叶向根的每层兄弟节点；单叶集合为空列表，空集合无成员证明"
+    )
+
+
+class MerkleVerifyOut(BaseModel):
+    """本地 Merkle 校验结果：结构非法时返回 400；结构合法但根不匹配时 200 + valid=false。"""
+
+    valid: bool
+    reason: str = Field(description="valid=true 时为 ok；否则给出根不匹配的说明")
+    leaf_hash: str = Field(description="由事件 ID / 承诺 ID / 承诺哈希严格重算的叶哈希")
+    computed_root: str = Field(description="按叶数据与证明路径重算出的 Merkle 根")
+    expected_root: str = Field(description="请求中声明的事件 Merkle 根（归一化为小写）")
+    tree_scheme: str
