@@ -58,6 +58,9 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | POST | `/events/{id}/commitments` | 提交承诺（64 位十六进制哈希） |
 | POST | `/events/{id}/commitments/batch` | 原子批量提交 1～100 个承诺（单事务，冲突整体回滚） |
 | GET | `/events/{id}/commitments` | 承诺列表（含是否已揭示） |
+| GET | `/events/{id}/commitments/proof/root` | 提交截止后获取承诺集合 Merkle 根与承诺数量 |
+| GET | `/events/{id}/commitments/{commitment_id}/proof` | 提交截止后获取指定承诺的集合成员证明 |
+| POST | `/utils/merkle-proof/verify` | 本地严格校验成员证明（叶数据、路径层级、根） |
 | POST | `/events/{id}/reveals` | 揭示：提交原文 + 盐，服务端重算校验 |
 | POST | `/events/{id}/reveals/batch` | 原子批量揭示 1～100 组原文与盐（单事务，冲突整体回滚） |
 | GET | `/events/{id}/timeline` | 可核验的事件时间线 |
@@ -463,6 +466,138 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals/batch \
 提交阶段再由 `reveals.commitment_id` 唯一约束兜底，竞争落败的整批请求回滚并
 收到逐项 `DUPLICATE_REVEAL` 清单。
 
+## 事件承诺集合证明（Merkle）
+
+提交截止后承诺集合即冻结。服务提供事件承诺集合的 **Merkle 根**与指定承诺的
+**成员证明**，调用方无需下载完整时间线即可验证「某个承诺确实进入了该事件」。
+证明为纯只读接口，不影响提交、揭示与结算流程。
+
+### 哈希与树构造规则
+
+- **叶节点按承诺 ID（UUID 128 位整数）升序排列**，与提交先后无关；
+- 叶哈希同时绑定**事件 ID、承诺 ID 与原有 commitment_hash**（UUID 取 16 字节
+  大端，承诺哈希取 32 字节），叶带独立域前缀，无法把其他事件 / 其他位置的
+  节点挪作他用：
+
+  ```
+  leaf = SHA-256( b"sealed-predictions:leaf:v1:"
+                  || uuid128be(event_id) || uuid128be(commitment_id)
+                  || commitment_hash_bytes )
+  ```
+
+- **内部节点与叶节点使用不同前缀**（域分离）：
+
+  ```
+  node = SHA-256( b"sealed-predictions:node:v1:" || left || right )
+  ```
+
+- 每层节点数为奇数时，**末项复制自身后配对**；因此单叶集合的根就是叶哈希本身
+  （零次内部哈希）；
+- **空集合**不经过叶 / 内部构造，返回固定空根
+  `SHA-256(b"sealed-predictions:empty:v1:")`（十六进制
+  `6d25267464b4d9156c5ba4e7dcd9d6d90d4b4cd4ca3fb6ba9ed25e02042097fe`）与
+  数量 `0`，与任何真实集合的根都不相同。
+
+### 根与数量：`GET /events/{id}/commitments/proof/root`
+
+仅在 **提交截止后**（`now >= commit_deadline`，reveal / closed 阶段均可）签发；
+未过提交截止时集合仍在变化，返回 `409 PROOF_NOT_AVAILABLE`。
+
+```bash
+curl -s http://localhost:8000/events/<EVENT_ID>/commitments/proof/root
+```
+
+```json
+{
+  "event_id": "<EVENT_ID>",
+  "merkle_root": "d1438805…",
+  "empty_root": "6d25267464b4d9156c5ba4e7dcd9d6d90d4b4cd4ca3fb6ba9ed25e02042097fe",
+  "commitment_count": 5,
+  "tree_scheme": "merkle-sha256-v1: …",
+  "leaf_scheme": "sha256('sealed-predictions:leaf:v1:' || …)",
+  "generated_at": "2030-01-01T00:00:00Z"
+}
+```
+
+零承诺事件同样返回 200：`commitment_count=0`、`merkle_root` 等于 `empty_root`。
+
+### 成员证明：`GET /events/{id}/commitments/{commitment_id}/proof`
+
+提交截止后为指定承诺签发证明，给出叶哈希、叶下标、叶总数、根与自叶向根的
+逐层兄弟哈希及左右位置。`position` 表示**兄弟相对当前节点**的位置：
+`left` = 兄弟在左（当前节点在右，父 = H(兄弟 ‖ 当前)），
+`right` = 兄弟在右（父 = H(当前 ‖ 兄弟)）；奇数层末项复制时，复制出的兄弟
+标记为 `left` 且其哈希等于当前节点。
+
+```bash
+curl -s http://localhost:8000/events/<EVENT_ID>/commitments/<COMMITMENT_ID>/proof
+```
+
+```json
+{
+  "event_id": "<EVENT_ID>",
+  "commitment_id": "<COMMITMENT_ID>",
+  "commitment_hash": "9f2c7fd2…",
+  "leaf_hash": "2a7f…",
+  "leaf_index": 3,
+  "leaf_count": 5,
+  "merkle_root": "d1438805…",
+  "proof": [
+    {"sibling": "…", "position": "left"},
+    {"sibling": "…", "position": "right"},
+    {"sibling": "…", "position": "left"}
+  ],
+  "tree_scheme": "merkle-sha256-v1: …",
+  "leaf_scheme": "sha256('sealed-predictions:leaf:v1:' || …)",
+  "generated_at": "2030-01-01T00:00:00Z"
+}
+```
+
+### 本地严格校验：`POST /utils/merkle-proof/verify`
+
+纯计算接口（不查询数据库、不做阶段判定），对**叶数据、路径与根**做严格校验：
+
+1. 按叶方案用 `event_id` + `commitment_id` + `commitment_hash` 重算叶哈希；
+2. 依据 `leaf_count` / `leaf_index` 重放每层配对结构（含奇数层末项复制），
+   逐层核对路径长度（必须恰好收敛到根）、每层兄弟左右位置、复制层兄弟必须
+   等于当前节点；
+3. 重算根并与 `merkle_root` 逐字节比较。
+
+全部通过返回 HTTP 200 与 `valid: true`；结构或根不符同样返回 200 与
+`valid: false` 及明确 `reason`（调用方据此区分拒绝原因）；哈希非 64 位
+十六进制、位置非 `left/right`、下标为负、`leaf_count<1`、路径超过 64 层等
+**请求体格式问题返回 422**。`commitment_hash` 大写会归一化为小写。
+
+```bash
+curl -s -X POST http://localhost:8000/utils/merkle-proof/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id": "<EVENT_ID>", "commitment_id": "<COMMITMENT_ID>",
+       "commitment_hash": "9f2c7fd2…", "leaf_index": 3, "leaf_count": 5,
+       "merkle_root": "d1438805…",
+       "proof": [{"sibling": "…", "position": "left"}, …]}'
+# 通过 => {"valid": true, "reason": null, "leaf_hash": "…",
+#          "computed_root": "d1438805…", "leaf_scheme": "…"}
+```
+
+| `valid=false` 的 reason | 含义 |
+|------|------|
+| `LEAF_INDEX_OUT_OF_RANGE` | `leaf_index` 越界（`leaf_count<1` 或下标不在 `[0, leaf_count)`） |
+| `PATH_TOO_LONG` | 已收敛到根却仍有证明步骤（或路径超过 64 层） |
+| `PATH_TOO_SHORT` | 步骤耗尽时尚未收敛到单根 |
+| `UNEXPECTED_POSITION` | 某层兄弟的左右位置与该层下标奇偶性不符 |
+| `DUPLICATION_MISMATCH` | 奇数层末项复制时兄弟不等于当前节点 / 位置不为 left |
+| `ROOT_MISMATCH` | 叶数据或兄弟被篡改，重算根与提供的根不一致（响应含 `computed_root` 便于排查） |
+
+证明端点与校验接口的错误：
+
+| HTTP | code | 场景 |
+|------|------|------|
+| 200 | — | 根 / 证明签发成功；本地校验请求格式合法（`valid` 表示校验结果） |
+| 404 | `EVENT_NOT_FOUND` | 事件不存在 |
+| 404 | `COMMITMENT_NOT_FOUND` | 承诺不存在，或不属于该事件 |
+| 409 | `PROOF_NOT_AVAILABLE` | 未过提交截止（含截止时间被延长后、新截止未到） |
+| 422 | — | 事件 / 承诺 ID 非 UUID；校验请求体格式错误 |
+
 ## 永久结算（`POST` / `GET /events/{id}/settlement`）
 
 事件进入 **closed 阶段**（`now >= reveal_deadline`）后，调用方可提交一个
@@ -555,6 +690,7 @@ curl -s http://localhost:8000/events/<EVENT_ID>/settlement
 | 400 | `MISSING_SNAPSHOT_TIME` / `INVALID_SNAPSHOT_TIME` / `NAIVE_SNAPSHOT_TIME` | 历史快照缺少 `at`、时间无法解析或未携带时区 |
 | 400 | `SNAPSHOT_BEFORE_CREATION` | 快照时刻早于事件创建时间 |
 | 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析/资源排程请求中的任一 ID） |
+| 404 | `COMMITMENT_NOT_FOUND` | 集合成员证明的承诺不存在或不属于该事件 |
 | 409 | `EXTENSION_NOT_IN_COMMIT_PHASE` | 延长截止时间时事件已离开 commit 阶段（reveal / closed） |
 | 409 | `INVALID_EXTENSION` | 延长请求未满足「只延不缩」或 reveal 须晚于新 commit 的约束 |
 | 409 | `COMMIT_PHASE_CLOSED` | 迟到提交（已过 commit_deadline） |
@@ -566,6 +702,7 @@ curl -s http://localhost:8000/events/<EVENT_ID>/settlement
 | 409 | `DUPLICATE_REVEAL` | 该承诺已被揭示（仅首次匹配生效） |
 | 409 | `BATCH_REVEAL_CONFLICT` | 批量揭示存在逐项冲突（`detail.conflicts` 给出每个冲突项的 index/type 与原文、盐、重算哈希） |
 | 409 | `SETTLEMENT_NOT_IN_CLOSED_PHASE` | 事件尚未进入 closed 阶段即提交结算 |
+| 409 | `PROOF_NOT_AVAILABLE` | 未过提交截止即请求承诺集合 Merkle 根或成员证明 |
 | 409 | `SETTLEMENT_ALREADY_CONFIRMED` | 事件已永久结算，重复结算被拒绝且不改写既有结果（`detail.conflicts[0].existing` 回显首次结果） |
 | 422 | — | 请求体格式校验失败（如哈希非 64 位十六进制、截止时间无时区、延长缺少 reason、结算标准结果为空） |
 
@@ -629,6 +766,7 @@ app/
   models.py     # SQLAlchemy 模型（events / commitments / reveals / deadline_extensions / settlements）
   schemas.py    # Pydantic 请求/响应模型
   hashing.py    # 承诺哈希方案实现
+  merkle.py     # 承诺集合 Merkle 树：叶/内部域前缀、末项复制、成员证明与严格校验（纯函数）
   database.py   # 引擎与会话（DATABASE_URL 可配置）
 tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
 tests/test_snapshot.py        # 历史时刻快照：延长回放、阶段与计数重放、400/404 错误
@@ -638,6 +776,8 @@ tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制
 tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
 tests/test_settlement.py      # 永久结算：精确匹配计数、未结算状态、重复结算冲突与不改写
+tests/test_merkle.py          # Merkle 纯函数：空根/单叶、末项复制、域分离、成员证明与严格层级校验
+tests/test_merkle_proofs_api.py  # 集合证明 API：阶段门禁、根/证明签发、本地校验、404/409 与现有流程不受影响
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

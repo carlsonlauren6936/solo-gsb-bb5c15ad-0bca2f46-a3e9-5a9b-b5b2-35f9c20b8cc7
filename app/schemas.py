@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -250,3 +250,70 @@ class ScheduleOut(BaseModel):
 class HashOut(BaseModel):
     commitment_hash: str
     hash_scheme: str
+
+
+class MerkleProofStep(BaseModel):
+    sibling: str = Field(
+        pattern=COMMITMENT_HASH_PATTERN,
+        description="该层兄弟节点哈希（64 位十六进制）",
+    )
+    position: Literal["left", "right"] = Field(
+        description="兄弟相对当前节点的位置：left=兄弟在左（当前在右），right=兄弟在右"
+    )
+
+
+class EventMerkleRootOut(BaseModel):
+    event_id: UUID
+    merkle_root: str = Field(description="承诺集合 Merkle 根（64 位十六进制；空集合为固定空根）")
+    empty_root: str = Field(description="空集合根值，便于调用方识别零承诺事件")
+    commitment_count: int = Field(description="参与构造的承诺（叶）数量")
+    tree_scheme: str = Field(description="Merkle 树构造方案说明")
+    leaf_scheme: str = Field(description="叶哈希绑定方案说明")
+    generated_at: datetime
+
+
+class MerkleProofOut(BaseModel):
+    event_id: UUID
+    commitment_id: UUID
+    commitment_hash: str
+    leaf_hash: str = Field(description="该承诺对应的叶哈希（绑定事件 ID、承诺 ID 与承诺哈希）")
+    leaf_index: int = Field(description="叶节点在按承诺 ID 升序排列中的下标（从 0 开始）")
+    leaf_count: int = Field(description="叶节点总数（= 事件承诺数量）")
+    merkle_root: str
+    proof: list[MerkleProofStep] = Field(description="自叶向根逐层的兄弟哈希与左右位置")
+    tree_scheme: str
+    leaf_scheme: str
+    generated_at: datetime
+
+
+class MerkleProofVerifyRequest(BaseModel):
+    event_id: UUID = Field(description="证明所属事件 ID（参与叶哈希绑定）")
+    commitment_id: UUID = Field(description="待验证的承诺 ID（参与叶哈希绑定）")
+    commitment_hash: str = Field(
+        pattern=COMMITMENT_HASH_PATTERN,
+        description="原承诺哈希（64 位十六进制；大写将归一化为小写）",
+    )
+    leaf_index: int = Field(ge=0, description="承诺 ID 升序叶序列中的下标（从 0 开始）")
+    leaf_count: int = Field(ge=1, description="叶节点总数")
+    merkle_root: str = Field(
+        pattern=COMMITMENT_HASH_PATTERN, description="待比对的事件 Merkle 根"
+    )
+    proof: list[MerkleProofStep] = Field(
+        max_length=64, description="自叶向根的兄弟哈希与左右位置（至多 64 层）"
+    )
+
+
+class MerkleProofVerifyOut(BaseModel):
+    valid: bool = Field(description="证明是否通过叶数据、路径层级与根的全部严格校验")
+    reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "校验失败原因：LEAF_INDEX_OUT_OF_RANGE / PATH_TOO_LONG / PATH_TOO_SHORT / "
+            "UNEXPECTED_POSITION / DUPLICATION_MISMATCH / ROOT_MISMATCH；通过时为 null"
+        ),
+    )
+    leaf_hash: str = Field(description="按叶方案重算的叶哈希")
+    computed_root: Optional[str] = Field(
+        default=None, description="按证明路径重算出的根（ROOT_MISMATCH 时仍返回以便排查）"
+    )
+    leaf_scheme: str
